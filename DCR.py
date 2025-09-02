@@ -12,10 +12,7 @@ Apply Azure Monitor (AMA) AgentDirectToStore using an exported DCR template.
 
 Prereqs:
   - Azure CLI installed (az) and logged in (`az login`)
-  - Python 3.8+
-
-Usage (interactive prompts):
-  python ama_apply_exported_dcr.py
+  - Python 3.8/3.9+
 """
 
 import json
@@ -25,12 +22,13 @@ import subprocess
 import sys
 import tempfile
 from datetime import datetime
+from typing import Optional, Dict, Any, List
 
 TEMPLATE_FILENAME = "DCR_deploy_new.json"
 
 # ---------- Shell helpers ----------
 
-def run(cmd, check=True, capture=True):
+def run(cmd, check=True, capture=True) -> str:
     shell = isinstance(cmd, str)
     try:
         res = subprocess.run(cmd, shell=shell, check=check,
@@ -40,7 +38,7 @@ def run(cmd, check=True, capture=True):
         msg = e.stderr.strip() or e.stdout.strip() or str(e)
         raise RuntimeError(f"Command failed: {cmd}\n{msg}") from e
 
-def az(*args, fmt="tsv"):
+def az(*args, fmt="tsv") -> str:
     if shutil.which("az") is None:
         raise RuntimeError("Azure CLI 'az' not found in PATH.")
     cmd = ["az"] + list(args)
@@ -48,7 +46,7 @@ def az(*args, fmt="tsv"):
         cmd += ["-o", fmt]
     return run(cmd)
 
-def az_json(*args):
+def az_json(*args) -> Any:
     out = az(*args, fmt="json")
     return json.loads(out) if out else {}
 
@@ -56,7 +54,7 @@ def info(msg): print(f"[INFO] {msg}")
 def warn(msg): print(f"[WARN] {msg}")
 def err (msg): print(f"[ERROR] {msg}", file=sys.stderr)
 
-def prompt(msg, default=None, required=False):
+def prompt(msg, default=None, required=False) -> str:
     q = f"{msg}"
     if default not in (None, ""):
         q += f" [{default}]"
@@ -72,32 +70,31 @@ def prompt(msg, default=None, required=False):
 
 # ---------- ARM template helpers ----------
 
-def _iter_resources(obj):
-    """Yield all resources arrays recursively in an ARM template."""
+def _iter_resources(obj: Any):
+    """Yield all resource dicts recursively in an ARM template."""
     if isinstance(obj, dict):
         if "resources" in obj and isinstance(obj["resources"], list):
             for r in obj["resources"]:
                 yield r
-                # nested resources may exist
-                yield from _iter_resources(r)
-        # Also check nested 'resources' in 'template' (linked templates)
+                for rr in _iter_resources(r):
+                    yield rr
         if "template" in obj and isinstance(obj["template"], dict):
-            yield from _iter_resources(obj["template"])
+            for rr in _iter_resources(obj["template"]):
+                yield rr
     elif isinstance(obj, list):
         for it in obj:
-            yield from _iter_resources(it)
+            for rr in _iter_resources(it):
+                yield rr
 
-def find_dcr_resources(template_json):
-    """Return a list of DCR resource dicts inside the template."""
+def find_dcr_resources(template_json: Dict[str, Any]) -> List[Dict[str, Any]]:
     res = []
     for r in _iter_resources(template_json):
         if isinstance(r, dict) and r.get("type") == "Microsoft.Insights/dataCollectionRules":
             res.append(r)
     return res
 
-def ensure_datasources_linux_defaults(props: dict):
+def ensure_datasources_linux_defaults(props: Dict[str, Any]) -> None:
     ds = props.setdefault("dataSources", {})
-    # Minimal safe defaults if missing
     if "syslog" not in ds or not ds["syslog"]:
         ds["syslog"] = [{
             "streams": ["Microsoft-Syslog"],
@@ -118,44 +115,38 @@ def ensure_datasources_linux_defaults(props: dict):
             "name": "linuxPerf"
         }]
 
-def patch_dcr_resource(dcr_res: dict, *,
-                       dcr_name_override: str | None,
-                       location_override: str | None,
-                       eventhub_id: str,
-                       storage_id: str,
-                       container_name: str,
-                       eh_dest_name: str = "ehDest",
-                       blob_dest_name: str = "blobDest"):
+def patch_dcr_resource(
+    dcr_res: Dict[str, Any],
+    *,
+    dcr_name_override: Optional[str],
+    location_override: Optional[str],
+    eventhub_id: str,
+    storage_id: str,
+    container_name: str,
+    eh_dest_name: str = "ehDest",
+    blob_dest_name: str = "blobDest"
+) -> None:
     """Force AgentDirectToStore and wire EH + Blob destinations + dataFlows."""
-    # Override name/location if provided (use literals)
     if dcr_name_override:
         dcr_res["name"] = dcr_name_override
     if location_override:
         dcr_res["location"] = location_override
 
-    # Properties
     props = dcr_res.setdefault("properties", {})
     dcr_res["kind"] = "AgentDirectToStore"
 
-    # Ensure Linux dataSources present
     ensure_datasources_linux_defaults(props)
 
-    # Destinations
     dest = props.setdefault("destinations", {})
     ehs = dest.setdefault("eventHubsDirect", [])
     blobs = dest.setdefault("storageBlobsDirect", [])
 
-    # Upsert EH destination
     if ehs:
         ehs[0]["name"] = eh_dest_name
         ehs[0]["eventHubResourceId"] = eventhub_id
     else:
-        ehs.append({
-            "name": eh_dest_name,
-            "eventHubResourceId": eventhub_id
-        })
+        ehs.append({"name": eh_dest_name, "eventHubResourceId": eventhub_id})
 
-    # Upsert Blob destination
     if blobs:
         blobs[0]["name"] = blob_dest_name
         blobs[0]["storageAccountResourceId"] = storage_id
@@ -167,7 +158,6 @@ def patch_dcr_resource(dcr_res: dict, *,
             "containerName": container_name
         })
 
-    # Data flows: ensure Syslog + Perf go to both EH + Blob
     flows = props.setdefault("dataFlows", [])
     if not flows:
         flows.extend([
@@ -181,12 +171,14 @@ def patch_dcr_resource(dcr_res: dict, *,
                 if need not in dests:
                     dests.append(need)
 
-def load_and_patch_template(path: str,
-                            dcr_name_override: str | None,
-                            location_override: str | None,
-                            eventhub_id: str,
-                            storage_id: str,
-                            container_name: str) -> dict:
+def load_and_patch_template(
+    path: str,
+    dcr_name_override: Optional[str],
+    location_override: Optional[str],
+    eventhub_id: str,
+    storage_id: str,
+    container_name: str
+) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
         tpl = json.load(f)
 
@@ -208,7 +200,7 @@ def load_and_patch_template(path: str,
 
 # ---------- Azure ops ----------
 
-def ensure_subscription(sub_id: str | None):
+def ensure_subscription(sub_id: Optional[str]) -> str:
     if sub_id:
         info(f"Setting subscription: {sub_id}")
         az("account", "set", "--subscription", sub_id, fmt=None)
@@ -217,7 +209,7 @@ def ensure_subscription(sub_id: str | None):
     info(f"Using active subscription: {sub_id}")
     return sub_id
 
-def get_vm_identity_principal_id(rg: str, vm: str) -> str | None:
+def get_vm_identity_principal_id(rg: str, vm: str) -> Optional[str]:
     pid = az("vm", "show", "-g", rg, "-n", vm, "--query", "identity.principalId")
     return pid if pid and pid != "None" else None
 
@@ -239,7 +231,7 @@ def assign_user_identity(rg: str, vm: str, uai_id: str) -> str:
     info(f"VM principalId (with UAI attached): {pid}")
     return pid
 
-def grant_role(principal_object_id: str, role: str, scope: str):
+def grant_role(principal_object_id: str, role: str, scope: str) -> None:
     info(f"Grant role '{role}' at scope:\n  {scope}")
     az_json(
         "role", "assignment", "create",
@@ -249,7 +241,7 @@ def grant_role(principal_object_id: str, role: str, scope: str):
         "--scope", scope
     )
 
-def ensure_container_exists(storage_id: str, container: str):
+def ensure_container_exists(storage_id: str, container: str) -> None:
     info(f"Ensuring blob container exists: {container}")
     acct = storage_id.split("/storageAccounts/")[-1].split("/")[0]
     try:
@@ -261,7 +253,7 @@ def ensure_container_exists(storage_id: str, container: str):
     except Exception as e:
         warn(f"Unable to create container automatically (continuing): {e}")
 
-def deploy_template_rg(rg: str, template_obj: dict):
+def deploy_template_rg(rg: str, template_obj: Dict[str, Any]) -> None:
     with tempfile.TemporaryDirectory() as td:
         tf = os.path.join(td, "patched_dcr.json")
         with open(tf, "w", encoding="utf-8") as f:
@@ -272,7 +264,6 @@ def deploy_template_rg(rg: str, template_obj: dict):
                       "-g", rg,
                       "--name", name,
                       "--template-file", tf)
-        # Try to pull resource ids
         try:
             outputs = out.get("properties", {}).get("outputResources", [])
             if outputs:
@@ -282,14 +273,14 @@ def deploy_template_rg(rg: str, template_obj: dict):
         except Exception:
             pass
 
-def get_dcr_ids_in_rg(rg: str):
+def get_dcr_ids_in_rg(rg: str) -> List[str]:
     arr = az_json("resource", "list",
                   "-g", rg,
                   "--resource-type", "Microsoft.Insights/dataCollectionRules",
                   "--query", "[].id")
     return arr or []
 
-def create_dcra_for_vm(sub_id: str, rg: str, vm: str, dcr_id: str):
+def create_dcra_for_vm(sub_id: str, rg: str, vm: str, dcr_id: str) -> str:
     dcra_name = f"dcra-{vm}"
     dcra_id = (f"/subscriptions/{sub_id}/resourceGroups/{rg}"
                f"/providers/Microsoft.Compute/virtualMachines/{vm}"
@@ -302,18 +293,11 @@ def create_dcra_for_vm(sub_id: str, rg: str, vm: str, dcr_id: str):
             "--properties", json.dumps(props))
     return dcra_id
 
-def install_ama_linux_extension(rg: str, vm: str, version: str, uai_id: str | None, allow_minor_auto_upgrade: bool):
+def install_ama_linux_extension(rg: str, vm: str, version: str, uai_id: Optional[str], allow_minor_auto_upgrade: bool) -> None:
     info(f"Installing AzureMonitorLinuxAgent extension v{version} on VM {vm}...")
     settings = {}
     if uai_id:
-        settings = {
-            "authentication": {
-                "managedIdentity": {
-                    "identifier-name": "mi_res_id",
-                    "identifier-value": uai_id
-                }
-            }
-        }
+        settings = {"authentication": {"managedIdentity": {"identifier-name": "mi_res_id", "identifier-value": uai_id}}}
     args = [
         "vm", "extension", "set",
         "--resource-group", rg,
@@ -335,22 +319,23 @@ def install_ama_linux_extension(rg: str, vm: str, version: str, uai_id: str | No
 
 # ---------- Main ----------
 
-def main():
+def main() -> None:
     print("=== AMA Direct-to-Store via Exported DCR Template ===")
 
-    # Core inputs
     subscription = prompt("Subscription ID (blank to use current)", default="")
     rg           = prompt("Target Resource Group (DCR + VM)", required=True)
     vm_name      = prompt("Target RHEL VM Name", required=True)
 
     # DCR overrides
-    dcr_name_ovr = prompt("Override DCR name? (blank to keep template)", default="")
-    location_ovr = prompt('Override DCR location? (default "centralus", blank keeps template)',
-                          default="centralus")
-    if location_ovr.lower() == "blank":
+    if prompt("Override DCR NAME? (y/N)", default="n").lower().startswith("y"):
+        dcr_name_ovr: Optional[str] = prompt("New DCR name", required=True)
+    else:
+        dcr_name_ovr = None
+
+    if prompt("Override DCR LOCATION? (y/N)", default="n").lower().startswith("y"):
+        location_ovr: Optional[str] = prompt('New location (e.g., "centralus")', default="centralus", required=True)
+    else:
         location_ovr = None
-    elif not location_ovr:
-        location_ovr = "centralus"
 
     # Destinations
     eventhub_id  = prompt("Event Hub Resource ID (must be the specific event hub)", required=True)
@@ -358,7 +343,8 @@ def main():
     container    = prompt('Blob container name', default="ama-logs")
 
     # Identity / agent
-    uai_id       = prompt("User Assigned Identity Resource ID (blank for system-assigned)", default="")
+    uai_raw      = prompt("User Assigned Identity Resource ID (blank for system-assigned)", default="")
+    uai_id: Optional[str] = uai_raw if uai_raw else None
     agent_ver    = prompt('AzureMonitorLinuxAgent version', default="1.21")
     auto_minor   = prompt('Enable minor auto-upgrade? (y/n)', default="y").lower().startswith("y")
 
@@ -384,9 +370,7 @@ def main():
         sys.exit(0)
 
     # Subscription
-    sub_id = az("account", "show", "--query", "id") if not subscription else None
-    sub_id = subscription or sub_id
-    ensure_subscription(subscription if subscription else None)
+    sub_id = ensure_subscription(subscription if subscription else None)
 
     # Load + patch template
     template_path = os.path.join(os.getcwd(), TEMPLATE_FILENAME)
@@ -395,8 +379,8 @@ def main():
 
     patched = load_and_patch_template(
         template_path,
-        dcr_name_override=(dcr_name_ovr or None),
-        location_override=(location_ovr or None),
+        dcr_name_override=dcr_name_ovr,
+        location_override=location_ovr,
         eventhub_id=eventhub_id,
         storage_id=storage_id,
         container_name=container
@@ -413,9 +397,7 @@ def main():
             info(f"VM already has system-assigned MI. principalId: {principal_id}")
 
     # RBAC
-    # EH Data Sender
     grant_role(principal_id, "Azure Event Hubs Data Sender", eventhub_id)
-    # Storage Blob Data Contributor
     grant_role(principal_id, "Storage Blob Data Contributor", storage_id)
 
     # Container (best-effort)
@@ -424,7 +406,7 @@ def main():
     # Deploy DCR
     deploy_template_rg(rg, patched)
 
-    # Resolve a DCR id to associate (pick the most recent by name override if provided, else first in RG)
+    # Resolve a DCR id to associate
     dcr_ids = get_dcr_ids_in_rg(rg)
     if not dcr_ids:
         raise RuntimeError("No DCR found after deployment.")
@@ -442,7 +424,7 @@ def main():
     create_dcra_for_vm(sub_id, rg, vm_name, dcr_id_to_use)
 
     # Install AMA extension
-    install_ama_linux_extension(rg, vm_name, agent_ver, uai_id if uai_id else None, allow_minor_auto_upgrade=auto_minor)
+    install_ama_linux_extension(rg, vm_name, agent_ver, uai_id, allow_minor_auto_upgrade=auto_minor)
 
     info("Complete. Logs (Syslog + Perf) will flow to Event Hub and Blob per the patched DCR.")
 
